@@ -5,109 +5,290 @@ const db = require("../database");
 const CATEGORIES = ["微型代步", "家用紧凑", "中大型", "商用"];
 const SCENARIOS = ["城市通勤", "长途", "载货"];
 
+function dbGet(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+      if (err) reject(err);
+      else resolve(row);
+    });
+  });
+}
+
+function dbAll(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
+
 function calculateDiversityScore(categoryDistribution, total) {
   const expectedPerCategory = total / 4;
   let maxDeviation = 0;
   categoryDistribution.forEach((c) => {
-    const deviation = Math.abs((c.count - expectedPerCategory) / expectedPerCategory) * 100;
+    const deviation =
+      Math.abs((c.count - expectedPerCategory) / expectedPerCategory) * 100;
     if (deviation > maxDeviation) maxDeviation = deviation;
   });
   return Math.max(0, 100 - maxDeviation * 0.5);
 }
 
-function getCurrentBaseline() {
-  return new Promise((resolve, reject) => {
-    db.serialize(() => {
-      db.get(
+async function getCurrentBaseline() {
+  const overall = await dbGet(
+    `SELECT 
+      COUNT(*) as total,
+      AVG(curb_weight) as avg_weight,
+      AVG(energy_density) as avg_energy_density,
+      SUM(CASE WHEN curb_weight < 1500 THEN 1 ELSE 0 END) as lightweight_count,
+      SUM(CASE WHEN curb_weight >= 1800 THEN 1 ELSE 0 END) as heavy_count,
+      SUM(CASE WHEN category = '中大型' OR category = '商用' THEN 1 ELSE 0 END) as large_category_count
+    FROM vehicles WHERE status = '在售'`,
+  );
+
+  const categories = await dbAll(
+    `SELECT category, COUNT(*) as count FROM vehicles WHERE status = '在售' GROUP BY category`,
+  );
+
+  const scenarioCoverage = await Promise.all(
+    SCENARIOS.map(async (scenario) => {
+      const row = await dbGet(
         `SELECT 
           COUNT(*) as total,
-          AVG(curb_weight) as avg_weight,
-          AVG(energy_density) as avg_energy_density,
-          SUM(CASE WHEN curb_weight < 1500 THEN 1 ELSE 0 END) as lightweight_count,
-          SUM(CASE WHEN curb_weight >= 1800 THEN 1 ELSE 0 END) as heavy_count,
-          SUM(CASE WHEN category = '中大型' OR category = '商用' THEN 1 ELSE 0 END) as large_category_count
+          SUM(CASE WHEN scenarios LIKE ? THEN 1 ELSE 0 END) as matched
         FROM vehicles WHERE status = '在售'`,
-        (err, overall) => {
-          if (err) return reject(err);
-
-          db.all(
-            `SELECT category, COUNT(*) as count FROM vehicles WHERE status = '在售' GROUP BY category`,
-            (err, categories) => {
-              if (err) return reject(err);
-
-              const scenarioPromises = SCENARIOS.map((scenario) => {
-                return new Promise((res, rej) => {
-                  db.get(
-                    `SELECT 
-                      COUNT(*) as total,
-                      SUM(CASE WHEN scenarios LIKE ? THEN 1 ELSE 0 END) as matched
-                    FROM vehicles WHERE status = '在售'`,
-                    [`%${scenario}%`],
-                    (err, row) => {
-                      if (err) rej(err);
-                      else
-                        res({
-                          scenario,
-                          coverage:
-                            row.total > 0
-                              ? parseFloat(((row.matched / row.total) * 100).toFixed(1))
-                              : 0,
-                        });
-                    },
-                  );
-                });
-              });
-
-              Promise.all(scenarioPromises).then((scenarioCoverage) => {
-                const categoryDistribution = categories.map((c) => ({
-                  category: c.category,
-                  count: c.count,
-                  ratio:
-                    overall.total > 0
-                      ? parseFloat(((c.count / overall.total) * 100).toFixed(1))
-                      : 0,
-                }));
-
-                const diversityScore = calculateDiversityScore(
-                  categoryDistribution,
-                  overall.total,
-                );
-
-                resolve({
-                  totalVehicles: overall.total,
-                  averageWeight: Math.round(overall.avg_weight),
-                  avgEnergyDensity: overall.avg_energy_density
-                    ? parseFloat(overall.avg_energy_density.toFixed(1))
-                    : 150,
-                  lightweightRatio:
-                    overall.total > 0
-                      ? parseFloat(
-                          ((overall.lightweight_count / overall.total) * 100).toFixed(1),
-                        )
-                      : 0,
-                  heavyRatio:
-                    overall.total > 0
-                      ? parseFloat(
-                          ((overall.heavy_count / overall.total) * 100).toFixed(1),
-                        )
-                      : 0,
-                  largeCategoryRatio:
-                    overall.total > 0
-                      ? parseFloat(
-                          ((overall.large_category_count / overall.total) * 100).toFixed(1),
-                        )
-                      : 0,
-                  categoryDistribution,
-                  scenarioCoverage,
-                  diversityScore: parseFloat(diversityScore.toFixed(1)),
-                });
-              });
-            },
-          );
-        },
+        [`%${scenario}%`],
       );
+      return {
+        scenario,
+        coverage:
+          row.total > 0
+            ? parseFloat(((row.matched / row.total) * 100).toFixed(1))
+            : 0,
+      };
+    }),
+  );
+
+  const categoryDistribution = categories.map((c) => ({
+    category: c.category,
+    count: c.count,
+    ratio:
+      overall.total > 0
+        ? parseFloat(((c.count / overall.total) * 100).toFixed(1))
+        : 0,
+  }));
+
+  const diversityScore = calculateDiversityScore(
+    categoryDistribution,
+    overall.total,
+  );
+
+  return {
+    totalVehicles: overall.total,
+    averageWeight: Math.round(overall.avg_weight),
+    avgEnergyDensity: overall.avg_energy_density
+      ? parseFloat(overall.avg_energy_density.toFixed(1))
+      : 150,
+    lightweightRatio:
+      overall.total > 0
+        ? parseFloat(
+            ((overall.lightweight_count / overall.total) * 100).toFixed(1),
+          )
+        : 0,
+    heavyRatio:
+      overall.total > 0
+        ? parseFloat(
+            ((overall.heavy_count / overall.total) * 100).toFixed(1),
+          )
+        : 0,
+    largeCategoryRatio:
+      overall.total > 0
+        ? parseFloat(
+            ((overall.large_category_count / overall.total) * 100).toFixed(1),
+          )
+        : 0,
+    categoryDistribution,
+    scenarioCoverage,
+    diversityScore: parseFloat(diversityScore.toFixed(1)),
+  };
+}
+
+function runPolicySimulation(baseline, params) {
+  const {
+    lightweightMaterialAdoption = 0,
+    batteryEnergyDensityImprovement = 0,
+    newEnergyVehicleIncentive = 0,
+    heavyVehicleRestriction = 0,
+    microVehicleSubsidy = 0,
+    simulationYears = 3,
+  } = params;
+
+  const results = [];
+  let currentState = { ...baseline };
+
+  for (let year = 1; year <= simulationYears; year++) {
+    const yearFactor = year / simulationYears;
+
+    const weightReduction = lightweightMaterialAdoption * 0.15 * yearFactor;
+    const newAvgWeight = Math.round(
+      baseline.averageWeight * (1 - weightReduction / 100),
+    );
+
+    const rangeImprovement = batteryEnergyDensityImprovement * 0.8 * yearFactor;
+
+    const incentiveEffect = newEnergyVehicleIncentive * 0.12 * yearFactor;
+    const heavyRestrictionEffect = heavyVehicleRestriction * 0.18 * yearFactor;
+    const microSubsidyEffect = microVehicleSubsidy * 0.25 * yearFactor;
+
+    const microGrowth = 1 + (incentiveEffect + microSubsidyEffect) / 100;
+    const compactGrowth = 1 + incentiveEffect / 150;
+    const midsizeGrowth =
+      1 + (incentiveEffect - heavyRestrictionEffect * 0.5) / 150;
+    const commercialGrowth =
+      1 + (incentiveEffect - heavyRestrictionEffect) / 150;
+
+    const categoryDistribution = currentState.categoryDistribution.map((c) => {
+      let growthRate = 1;
+      switch (c.category) {
+        case "微型代步":
+          growthRate = microGrowth;
+          break;
+        case "家用紧凑":
+          growthRate = compactGrowth;
+          break;
+        case "中大型":
+          growthRate = midsizeGrowth;
+          break;
+        case "商用":
+          growthRate = commercialGrowth;
+          break;
+      }
+      return {
+        ...c,
+        count: Math.round(c.count * growthRate),
+      };
     });
+
+    const newTotal = categoryDistribution.reduce((sum, c) => sum + c.count, 0);
+    categoryDistribution.forEach((c) => {
+      c.ratio = parseFloat(((c.count / newTotal) * 100).toFixed(1));
+    });
+
+    const newHeavyRatio = Math.max(
+      0,
+      parseFloat(
+        (baseline.heavyRatio * (1 - heavyRestrictionEffect / 200)).toFixed(1),
+      ),
+    );
+    const newLightweightRatio = Math.min(
+      100,
+      parseFloat(
+        (
+          baseline.lightweightRatio *
+          (1 + lightweightMaterialAdoption / 200 + microSubsidyEffect / 300)
+        ).toFixed(1),
+      ),
+    );
+    const newLargeCategoryRatio = parseFloat(
+      categoryDistribution
+        .filter((c) => c.category === "中大型" || c.category === "商用")
+        .reduce((sum, c) => sum + c.ratio, 0)
+        .toFixed(1),
+    );
+
+    const scenarioCoverage = SCENARIOS.map((scenario) => {
+      const base = baseline.scenarioCoverage.find(
+        (s) => s.scenario === scenario,
+      );
+      let improvement = 0;
+      if (scenario === "城市通勤") {
+        improvement =
+          microSubsidyEffect * 0.3 + lightweightMaterialAdoption * 0.15;
+      } else if (scenario === "长途") {
+        improvement = batteryEnergyDensityImprovement * 0.4;
+      } else if (scenario === "载货") {
+        improvement = newEnergyVehicleIncentive * 0.2;
+      }
+      return {
+        scenario,
+        coverage: Math.min(
+          100,
+          parseFloat((base.coverage * (1 + improvement / 100)).toFixed(1)),
+        ),
+        improvement: parseFloat(improvement.toFixed(1)),
+      };
+    });
+
+    const diversityScore = calculateDiversityScore(
+      categoryDistribution,
+      newTotal,
+    );
+
+    const concentrationLevel =
+      newHeavyRatio > 55 || newLargeCategoryRatio > 60
+        ? "高度集中"
+        : newHeavyRatio > 40 || newLargeCategoryRatio > 50
+          ? "中度集中"
+          : "分布均衡";
+
+    const hasLongDistance = baseline.scenarioCoverage.some(
+      (s) => s.scenario === "长途",
+    );
+
+    const yearResult = {
+      year,
+      yearLabel: `第${year}年`,
+      totalVehicles: newTotal,
+      averageWeight: newAvgWeight,
+      avgRange: Math.round(
+        hasLongDistance ? 450 * (1 + rangeImprovement / 100) : 450,
+      ),
+      lightweightRatio: newLightweightRatio,
+      heavyRatio: newHeavyRatio,
+      largeCategoryRatio: newLargeCategoryRatio,
+      categoryDistribution,
+      scenarioCoverage,
+      diversityScore: parseFloat(diversityScore.toFixed(1)),
+      concentrationLevel,
+      changes: {
+        totalVehicles: parseFloat(
+          (
+            ((newTotal - baseline.totalVehicles) / baseline.totalVehicles) *
+            100
+          ).toFixed(1),
+        ),
+        averageWeight: parseFloat(
+          (
+            ((newAvgWeight - baseline.averageWeight) / baseline.averageWeight) *
+            100
+          ).toFixed(1),
+        ),
+        lightweightRatio: parseFloat(
+          (newLightweightRatio - baseline.lightweightRatio).toFixed(1),
+        ),
+        diversityScore: parseFloat(
+          (diversityScore - baseline.diversityScore).toFixed(1),
+        ),
+      },
+    };
+
+    results.push(yearResult);
+    currentState = {
+      ...currentState,
+      categoryDistribution,
+      totalVehicles: newTotal,
+    };
+  }
+
+  const insights = generateSimulationInsights(results, baseline, {
+    lightweightMaterialAdoption,
+    batteryEnergyDensityImprovement,
+    newEnergyVehicleIncentive,
+    heavyVehicleRestriction,
+    microVehicleSubsidy,
   });
+
+  return { results, insights };
 }
 
 router.post("/simulate/policy", async (req, res) => {
@@ -123,154 +304,13 @@ router.post("/simulate/policy", async (req, res) => {
 
     const baseline = await getCurrentBaseline();
 
-    const results = [];
-    let currentState = { ...baseline };
-
-    for (let year = 1; year <= simulationYears; year++) {
-      const yearFactor = year / simulationYears;
-
-      const weightReduction = lightweightMaterialAdoption * 0.15 * yearFactor;
-      const newAvgWeight = Math.round(
-        baseline.averageWeight * (1 - weightReduction / 100),
-      );
-
-      const rangeImprovement = batteryEnergyDensityImprovement * 0.8 * yearFactor;
-
-      const incentiveEffect = newEnergyVehicleIncentive * 0.12 * yearFactor;
-      const heavyRestrictionEffect = heavyVehicleRestriction * 0.18 * yearFactor;
-      const microSubsidyEffect = microVehicleSubsidy * 0.25 * yearFactor;
-
-      const microGrowth = 1 + (incentiveEffect + microSubsidyEffect) / 100;
-      const compactGrowth = 1 + incentiveEffect / 150;
-      const midsizeGrowth = 1 + (incentiveEffect - heavyRestrictionEffect * 0.5) / 150;
-      const commercialGrowth = 1 + (incentiveEffect - heavyRestrictionEffect) / 150;
-
-      const categoryDistribution = currentState.categoryDistribution.map((c) => {
-        let growthRate = 1;
-        switch (c.category) {
-          case "微型代步":
-            growthRate = microGrowth;
-            break;
-          case "家用紧凑":
-            growthRate = compactGrowth;
-            break;
-          case "中大型":
-            growthRate = midsizeGrowth;
-            break;
-          case "商用":
-            growthRate = commercialGrowth;
-            break;
-        }
-        return {
-          ...c,
-          count: Math.round(c.count * growthRate),
-        };
-      });
-
-      const newTotal = categoryDistribution.reduce((sum, c) => sum + c.count, 0);
-      categoryDistribution.forEach((c) => {
-        c.ratio = parseFloat(((c.count / newTotal) * 100).toFixed(1));
-      });
-
-      const newHeavyRatio = Math.max(
-        0,
-        parseFloat(
-          (baseline.heavyRatio * (1 - heavyRestrictionEffect / 200)).toFixed(1),
-        ),
-      );
-      const newLightweightRatio = Math.min(
-        100,
-        parseFloat(
-          (
-            baseline.lightweightRatio *
-            (1 + lightweightMaterialAdoption / 200 + microSubsidyEffect / 300)
-          ).toFixed(1),
-        ),
-      );
-      const newLargeCategoryRatio = parseFloat(
-        (
-          categoryDistribution
-            .filter((c) => c.category === "中大型" || c.category === "商用")
-            .reduce((sum, c) => sum + c.ratio, 0)
-        ).toFixed(1),
-      );
-
-      const scenarioCoverage = SCENARIOS.map((scenario) => {
-        const base = baseline.scenarioCoverage.find((s) => s.scenario === scenario);
-        let improvement = 0;
-        if (scenario === "城市通勤") {
-          improvement = microSubsidyEffect * 0.3 + lightweightMaterialAdoption * 0.15;
-        } else if (scenario === "长途") {
-          improvement = batteryEnergyDensityImprovement * 0.4;
-        } else if (scenario === "载货") {
-          improvement = newEnergyVehicleIncentive * 0.2;
-        }
-        return {
-          scenario,
-          coverage: Math.min(
-            100,
-            parseFloat((base.coverage * (1 + improvement / 100)).toFixed(1)),
-          ),
-          improvement: parseFloat(improvement.toFixed(1)),
-        };
-      });
-
-      const diversityScore = calculateDiversityScore(categoryDistribution, newTotal);
-
-      const concentrationLevel =
-        newHeavyRatio > 55 || newLargeCategoryRatio > 60
-          ? "高度集中"
-          : newHeavyRatio > 40 || newLargeCategoryRatio > 50
-            ? "中度集中"
-            : "分布均衡";
-
-      const yearResult = {
-        year,
-        yearLabel: `第${year}年`,
-        totalVehicles: newTotal,
-        averageWeight: newAvgWeight,
-        avgRange: Math.round(
-          baseline.scenarioCoverage.find((s) => s.scenario === "长途")
-            ? 450 * (1 + rangeImprovement / 100)
-            : 450,
-        ),
-        lightweightRatio: newLightweightRatio,
-        heavyRatio: newHeavyRatio,
-        largeCategoryRatio: newLargeCategoryRatio,
-        categoryDistribution,
-        scenarioCoverage,
-        diversityScore: parseFloat(diversityScore.toFixed(1)),
-        concentrationLevel,
-        changes: {
-          totalVehicles: parseFloat(
-            (((newTotal - baseline.totalVehicles) / baseline.totalVehicles) * 100).toFixed(1),
-          ),
-          averageWeight: parseFloat(
-            (((newAvgWeight - baseline.averageWeight) / baseline.averageWeight) * 100).toFixed(1),
-          ),
-          lightweightRatio: parseFloat(
-            (newLightweightRatio - baseline.lightweightRatio).toFixed(1),
-          ),
-          diversityScore: parseFloat(
-            (diversityScore - baseline.diversityScore).toFixed(1),
-          ),
-        },
-      };
-
-      results.push(yearResult);
-      currentState = {
-        ...currentState,
-        categoryDistribution,
-        totalVehicles: newTotal,
-      };
-    }
-
-    const insights = generateSimulationInsights(results, baseline, {
+    const { results, insights } = runPolicySimulation(baseline, {
       lightweightMaterialAdoption,
       batteryEnergyDensityImprovement,
       newEnergyVehicleIncentive,
       heavyVehicleRestriction,
       microVehicleSubsidy,
+      simulationYears,
     });
 
     res.json({
@@ -553,7 +593,13 @@ function calculateEnergyDensityScore(density) {
   return 35;
 }
 
-function generateRecommendationReasons(vehicle, scores, scenario, minBudget, maxBudget) {
+function generateRecommendationReasons(
+  vehicle,
+  scores,
+  scenario,
+  minBudget,
+  maxBudget,
+) {
   const reasons = [];
   const priceScore = scores.find((s) => s.name === "价格匹配度");
   const scenarioScore = scores.find((s) => s.name === "场景匹配度");
@@ -810,154 +856,8 @@ function generateBaselineAnalysis(baseline) {
 }
 
 async function runSimulationForReport(params) {
-  return new Promise((resolve, reject) => {
-    const {
-      lightweightMaterialAdoption = 0,
-      batteryEnergyDensityImprovement = 0,
-      newEnergyVehicleIncentive = 0,
-      heavyVehicleRestriction = 0,
-      microVehicleSubsidy = 0,
-      simulationYears = 3,
-    } = params;
-
-    getCurrentBaseline().then((baseline) => {
-      const results = [];
-      let currentState = { ...baseline };
-
-      for (let year = 1; year <= simulationYears; year++) {
-        const yearFactor = year / simulationYears;
-        const weightReduction = lightweightMaterialAdoption * 0.15 * yearFactor;
-        const newAvgWeight = Math.round(
-          baseline.averageWeight * (1 - weightReduction / 100),
-        );
-        const rangeImprovement =
-          batteryEnergyDensityImprovement * 0.8 * yearFactor;
-        const incentiveEffect = newEnergyVehicleIncentive * 0.12 * yearFactor;
-        const heavyRestrictionEffect =
-          heavyVehicleRestriction * 0.18 * yearFactor;
-        const microSubsidyEffect = microVehicleSubsidy * 0.25 * yearFactor;
-
-        const microGrowth =
-          1 + (incentiveEffect + microSubsidyEffect) / 100;
-        const compactGrowth = 1 + incentiveEffect / 150;
-        const midsizeGrowth =
-          1 + (incentiveEffect - heavyRestrictionEffect * 0.5) / 150;
-        const commercialGrowth =
-          1 + (incentiveEffect - heavyRestrictionEffect) / 150;
-
-        const categoryDistribution = currentState.categoryDistribution.map(
-          (c) => {
-            let growthRate = 1;
-            switch (c.category) {
-              case "微型代步":
-                growthRate = microGrowth;
-                break;
-              case "家用紧凑":
-                growthRate = compactGrowth;
-                break;
-              case "中大型":
-                growthRate = midsizeGrowth;
-                break;
-              case "商用":
-                growthRate = commercialGrowth;
-                break;
-            }
-            return { ...c, count: Math.round(c.count * growthRate) };
-          },
-        );
-
-        const newTotal = categoryDistribution.reduce(
-          (sum, c) => sum + c.count,
-          0,
-        );
-        categoryDistribution.forEach((c) => {
-          c.ratio = parseFloat(((c.count / newTotal) * 100).toFixed(1));
-        });
-
-        const newHeavyRatio = Math.max(
-          0,
-          parseFloat(
-            (
-              baseline.heavyRatio *
-              (1 - heavyRestrictionEffect / 200)
-            ).toFixed(1),
-          ),
-        );
-        const newLightweightRatio = Math.min(
-          100,
-          parseFloat(
-            (
-              baseline.lightweightRatio *
-              (1 +
-                lightweightMaterialAdoption / 200 +
-                microSubsidyEffect / 300)
-            ).toFixed(1),
-          ),
-        );
-        const newLargeCategoryRatio = parseFloat(
-          categoryDistribution
-            .filter((c) => c.category === "中大型" || c.category === "商用")
-            .reduce((sum, c) => sum + c.ratio, 0)
-            .toFixed(1),
-        );
-
-        const scenarioCoverage = SCENARIOS.map((scenario) => {
-          const base = baseline.scenarioCoverage.find(
-            (s) => s.scenario === scenario,
-          );
-          let improvement = 0;
-          if (scenario === "城市通勤")
-            improvement =
-              microSubsidyEffect * 0.3 + lightweightMaterialAdoption * 0.15;
-          else if (scenario === "长途")
-            improvement = batteryEnergyDensityImprovement * 0.4;
-          else if (scenario === "载货")
-            improvement = newEnergyVehicleIncentive * 0.2;
-          return {
-            scenario,
-            coverage: Math.min(
-              100,
-              parseFloat(
-                (base.coverage * (1 + improvement / 100)).toFixed(1),
-              ),
-            ),
-          };
-        });
-
-        const diversityScore = calculateDiversityScore(
-          categoryDistribution,
-          newTotal,
-        );
-
-        results.push({
-          year,
-          totalVehicles: newTotal,
-          averageWeight: newAvgWeight,
-          avgRange: Math.round(450 * (1 + rangeImprovement / 100)),
-          lightweightRatio: newLightweightRatio,
-          heavyRatio: newHeavyRatio,
-          largeCategoryRatio: newLargeCategoryRatio,
-          categoryDistribution,
-          scenarioCoverage,
-          diversityScore: parseFloat(diversityScore.toFixed(1)),
-        });
-
-        currentState = {
-          ...currentState,
-          categoryDistribution,
-          totalVehicles: newTotal,
-        };
-      }
-
-      const insights = generateSimulationInsights(
-        results,
-        baseline,
-        params,
-      );
-
-      resolve({ results, insights });
-    });
-  });
+  const baseline = await getCurrentBaseline();
+  return runPolicySimulation(baseline, params);
 }
 
 async function runRecommendationForReport(criteria) {
@@ -1030,7 +930,10 @@ async function runRecommendationForReport(criteria) {
           },
           {
             name: "轻量化优势",
-            score: calculateLightweightScore(v.curb_weight, lightweightPreferred),
+            score: calculateLightweightScore(
+              v.curb_weight,
+              lightweightPreferred,
+            ),
             weight: lightweightPreferred ? 0.15 : 0.1,
           },
           {
@@ -1050,7 +953,12 @@ async function runRecommendationForReport(criteria) {
           minBudget,
           maxBudget,
         );
-        return { ...v, scores, totalScore: parseFloat(totalScore.toFixed(1)), reasons };
+        return {
+          ...v,
+          scores,
+          totalScore: parseFloat(totalScore.toFixed(1)),
+          reasons,
+        };
       });
 
       scoredVehicles.sort((a, b) => b.totalScore - a.totalScore);
@@ -1083,12 +991,17 @@ function getMarketConcentration() {
             if (err) return reject(err);
             const heavyRatio =
               overall.total > 0
-                ? parseFloat(((overall.heavy_count / overall.total) * 100).toFixed(1))
+                ? parseFloat(
+                    ((overall.heavy_count / overall.total) * 100).toFixed(1),
+                  )
                 : 0;
             const largeCategoryRatio =
               overall.total > 0
                 ? parseFloat(
-                    ((overall.large_category_count / overall.total) * 100).toFixed(1),
+                    (
+                      (overall.large_category_count / overall.total) *
+                      100
+                    ).toFixed(1),
                   )
                 : 0;
             resolve({
@@ -1236,7 +1149,8 @@ router.get("/simulate/parameters", (req, res) => {
         max: 100,
         step: 5,
         default: 0,
-        description: "假设高强度钢、铝合金、碳纤维等轻量化材料在新车中的应用比例提升幅度",
+        description:
+          "假设高强度钢、铝合金、碳纤维等轻量化材料在新车中的应用比例提升幅度",
         impact:
           "普及率提升将降低行业平均整备质量，提高轻量化车型占比，改善城市通勤场景覆盖",
       },
